@@ -1,15 +1,27 @@
 // Nudge Preview — Supertails. Buzz shows .html attachments as code; this plugin plays them.
-// Clicking an .html file card opens a side panel with the file running in a sandboxed iframe
-// at phone size (390x844), over an app-grey backdrop. CleverTap / webkit bridge calls are
-// stubbed: they are listed in the panel (event name + properties), never sent anywhere.
+//
+// Buzz's CSP is `script-src 'self' blob:` and a frame inherits it, so a nudge's inline <script>
+// never runs in a plain iframe. The plugin rewrites the file: every inline script and inline
+// on* handler becomes a blob: script (allowed by that CSP), then the result plays in a same-origin
+// iframe at phone size. Same-origin means the nudge runs with Buzz's access, so previews are only
+// offered for files sent by TRUSTED people (Jermy + the Supertails Buzz bots). CleverTap / iOS bridge
+// calls are stubbed and listed under the phone; nothing is sent.
 export const inject = ["react", "panels", "conversation"];
 
+// pubkeys whose .html attachments may be previewed (Jermy, Nudge Builder, Comms Orchestrator, Designer)
+const TRUSTED = new Set([
+  "12e99c820ac913b04092c72564d52c16125171caf061a8c432fddb4e3fa42a32",
+  "286f9af3d3bf6365209a0b18f5f818f7061644302bd9cda355aea11ffcb48398",
+  "c7e97c5c0b12855cbdee79bcad7c0e3c70bbec3d75b28d09070e3c937837f6af",
+  "51c081783b2a603bcb0b2911255a8eed62c889d398d4a08662f86a24d0c5bae9",
+]);
 const SCHEME = "supertails-nudge:";
 const PHONE_W = 390, PHONE_H = 844;
 
 const isHtml = (a) =>
   a && a.kind === "file" &&
   (/\.html?$/i.test(a.name || "") || /^text\/html\b/i.test(a.mime || ""));
+const trusted = (m) => !!m && TRUSTED.has(m.authorId) && (!m.signerId || TRUSTED.has(m.signerId));
 
 const toTarget = (source, name) =>
   SCHEME + encodeURIComponent(JSON.stringify({ s: source, n: name || "nudge.html" }));
@@ -21,22 +33,55 @@ function fromTarget(t) {
   } catch (e) { return null; }
 }
 
-// Runs inside the iframe before the nudge's own scripts.
-const STUB = `<script>(function(){
-  function post(kind, name, args){ try{ parent.postMessage({__nudgePreview:1, kind:kind, name:String(name), args:JSON.parse(JSON.stringify(Array.prototype.slice.call(args||[])))}, "*"); }catch(e){ try{ parent.postMessage({__nudgePreview:1, kind:kind, name:String(name), args:[String(args&&args[0])]}, "*"); }catch(_){} } }
-  var ct = new Proxy({}, { get: function(_, k){ return function(){ post("clevertap", k, arguments); }; } });
-  window.CleverTap = ct;
+// BEGIN-BUILD (kept self-contained: the test harness extracts this block)
+const STUB_JS = `(function(){
+  function post(kind, name, args){ var a; try{ a = JSON.parse(JSON.stringify(Array.prototype.slice.call(args||[]))); }catch(e){ a = [String(args && args[0])]; }
+    try{ parent.postMessage({__nudgePreview:1, kind:kind, name:String(name), args:a}, "*"); }catch(e){} }
+  window.CleverTap = new Proxy({}, { get: function(_, k){ return function(){ post("clevertap", k, arguments); }; } });
   var handler = function(n){ return { postMessage: function(m){ post("webkit", n, [m]); } }; };
   window.webkit = { messageHandlers: new Proxy({}, { get: function(_, k){ return handler(k); } }) };
   window.open = function(u){ post("open", "window.open", [u]); return null; };
   document.addEventListener("click", function(e){ var a = e.target && e.target.closest && e.target.closest("a[href]"); if(a){ e.preventDefault(); post("open", "link", [a.getAttribute("href")]); } }, true);
-})();<\/script>`;
+})();`;
 
-function withStub(html) {
-  const m = /<head[^>]*>/i.exec(html);
-  if (m) return html.slice(0, m.index + m[0].length) + STUB + html.slice(m.index + m[0].length);
-  return STUB + html;
+// Returns { html, urls }: inline scripts and on* attributes moved into blob: scripts.
+function buildDoc(html) {
+  const urls = [];
+  const blob = (code) => { const u = URL.createObjectURL(new Blob([code], { type: "text/javascript" })); urls.push(u); return u; };
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const handlers = [];
+  let n = 0;
+  doc.querySelectorAll("*").forEach((el) => {
+    for (const at of Array.from(el.attributes)) {
+      if (/^on[a-z]+$/i.test(at.name) && at.value.trim()) {
+        const id = "np" + (n++);
+        el.setAttribute("data-np", id);
+        handlers.push("(function(){var el=document.querySelector('[data-np=\"" + id + "\"]');if(el)el.addEventListener(" +
+          JSON.stringify(at.name.slice(2).toLowerCase()) + ",function(event){" + at.value + "\n}.bind(el));})();");
+        el.removeAttribute(at.name);
+      }
+    }
+  });
+  doc.querySelectorAll("script").forEach((s) => {
+    const type = (s.getAttribute("type") || "").trim().toLowerCase();
+    if (s.src || (type && !/javascript|ecmascript|^module$/.test(type))) return;
+    const r = doc.createElement("script");
+    for (const at of Array.from(s.attributes)) r.setAttribute(at.name, at.value);
+    r.setAttribute("src", blob(s.textContent || ""));
+    s.replaceWith(r);
+  });
+  const head = doc.head || doc.documentElement;
+  const stub = doc.createElement("script");
+  stub.setAttribute("src", blob(STUB_JS));
+  head.insertBefore(stub, head.firstChild);
+  if (handlers.length) {
+    const hs = doc.createElement("script");
+    hs.setAttribute("src", blob(handlers.join("\n")));
+    (doc.body || doc.documentElement).appendChild(hs);
+  }
+  return { html: "<!doctype html>\n" + doc.documentElement.outerHTML, urls };
 }
+// END-BUILD
 
 export function apply(ctx) {
   const React = ctx.react;
@@ -61,7 +106,8 @@ export function apply(ctx) {
   function Preview({ target }) {
     const info = fromTarget(target);
     if (typeof ctx.panels.useTabTitle === "function") ctx.panels.useTabTitle(info ? info.n : "Nudge Preview");
-    const [html, setHtml] = useState(null);
+    const [raw, setRaw] = useState(null);
+    const [built, setBuilt] = useState(null);
     const [err, setErr] = useState(null);
     const [run, setRun] = useState(0);
     const [events, setEvents] = useState([]);
@@ -72,12 +118,20 @@ export function apply(ctx) {
     useEffect(() => {
       if (!info) return;
       let live = true;
-      setHtml(null); setErr(null);
+      setRaw(null); setErr(null);
       fetch(info.s).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
-        .then((t) => { if (live) setHtml(withStub(t)); })
+        .then((t) => { if (live) setRaw(t); })
         .catch((e) => { if (live) setErr(String((e && e.message) || e)); });
       return () => { live = false; };
     }, [target]);
+
+    // fresh blob scripts for every run (Replay), revoked when replaced
+    useEffect(() => {
+      if (raw == null) return;
+      let b;
+      try { b = buildDoc(raw); setBuilt(b.html); } catch (e) { setErr("Could not prepare the file: " + e.message); }
+      return () => { if (b) b.urls.forEach((u) => URL.revokeObjectURL(u)); };
+    }, [raw, run]);
 
     useEffect(() => {
       const on = (e) => {
@@ -106,7 +160,7 @@ export function apply(ctx) {
       return () => ro.disconnect();
     }, []);
 
-    const replay = useCallback(() => { setClosed(false); setEvents([]); setRun((n) => n + 1); }, []);
+    const replay = useCallback(() => { setClosed(false); setEvents([]); setBuilt(null); setRun((n) => n + 1); }, []);
 
     const btn = (label, onClick) => h("button", {
       onClick, style: { font: "inherit", fontSize: 12, padding: "5px 12px", borderRadius: 999, cursor: "pointer",
@@ -121,10 +175,9 @@ export function apply(ctx) {
           borderRadius: 28 * scale + 8, overflow: "hidden", boxShadow: "0 0 0 6px #111, 0 10px 30px rgba(0,0,0,.35)",
           background: "linear-gradient(#f4f5f7 0 12%, #e6e8ec 12% 100%)" } },
         err ? h("div", { style: { padding: 20, color: "#b42318", fontSize: 13 } }, "Could not load the file: " + err)
-          : !html ? h("div", { style: { padding: 20, fontSize: 13, color: "#555" } }, "Loading…")
+          : !built ? h("div", { style: { padding: 20, fontSize: 13, color: "#555" } }, "Loading…")
           : h("iframe", {
-              key: run, ref: frame, srcDoc: html, title: info.n,
-              sandbox: "allow-scripts allow-forms allow-pointer-lock",
+              key: run, ref: frame, srcDoc: built, title: info.n,
               style: { width: PHONE_W, height: PHONE_H, border: 0, transform: "scale(" + scale + ")", transformOrigin: "0 0",
                 position: "absolute", left: 0, top: 0, background: "transparent", visibility: closed ? "hidden" : "visible" } }),
         closed ? h("div", { style: { position: "absolute", inset: 0, display: "flex", flexDirection: "column", gap: 10,
@@ -147,21 +200,24 @@ export function apply(ctx) {
     component: Preview,
   });
 
+  // matches() only sees the attachment, not the sender: trust is decided inside the component
   ctx.conversation.registerAttachment({
-    id: "nudge-html",
+    id: "nudge-html-card",
     title: "Nudge Preview",
     order: -10,
     matches: isHtml,
-    component: function NudgeCard({ attachment, source, placement, FileCard, open }) {
-      const preview = () => { if (source) void open(toTarget(source, attachment.name)); };
+    component: function NudgeCard({ attachment, source, placement, message, FileCard, open }) {
+      const ok = trusted(message) && !!source && placement === "message";
+      const preview = () => { if (ok) void open(toTarget(source, attachment.name)); };
       if (FileCard) {
         return h(FileCard, {
-          attachment, source, onOpenLink: open, typeLabel: "Nudge · tap to preview",
-          ...(placement === "message" && source ? { onPreview: preview } : {}),
+          attachment, source, onOpenLink: open,
+          typeLabel: ok ? "Nudge · tap to play" : "HTML · preview only for files from Jermy or the bots",
+          ...(ok ? { onPreview: preview } : {}),
         });
       }
-      return h("button", { onClick: preview, style: { font: "inherit", padding: "8px 12px", borderRadius: 10, cursor: "pointer" } },
-        "▶ Preview " + (attachment.name || "nudge"));
+      return ok ? h("button", { onClick: preview, style: { font: "inherit", padding: "8px 12px", borderRadius: 10, cursor: "pointer" } },
+        "▶ Play " + (attachment.name || "nudge")) : null;
     },
   });
 }
