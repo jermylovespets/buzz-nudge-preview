@@ -1,0 +1,7 @@
+{
+  "id": "supertails.nudge-preview",
+  "name": "Nudge Preview",
+  "apiVersion": 1,
+  "description": "Plays .html nudge attachments live in a phone frame instead of showing their code. CleverTap calls are captured and listed, never sent.",
+  "discovery": { "category": "productivity", "tags": ["CleverTap", "Nudge", "HTML", "Supertails"] }
+}
