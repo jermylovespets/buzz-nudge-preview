@@ -10,7 +10,7 @@ Built for CleverTap custom-HTML in-app nudges:
 - The file runs in a sandboxed iframe (`allow-scripts` only, no same-origin access to Buzz).
 
 ## Install
-Buzz → Settings → Plugins → Manage plugins → Add → paste `SupertailsPCPL/buzz-nudge-preview` → Find → Install.
+Buzz → Settings → Plugins → Manage plugins → Add → paste `jermylovespets/buzz-nudge-preview` → Find → Install.
 
 ## How it works
 One ES module (`plugin.js`, plugin API v1):
